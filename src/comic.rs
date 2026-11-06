@@ -2708,7 +2708,14 @@ fn write_fixed_layout_epub_v2(
         fs::write(temp_dir.join(&filename), xhtml.as_bytes())?;
     }
     // CSS for KF8 fixed-layout rendering (kindle:flow:0001).
-    let css = "@page {\nmargin: 0;\n}\nbody {\ndisplay: block;\nmargin: 0;\npadding: 0;\n}\n";
+    let mut css = String::from(
+        "@page {\nmargin: 0;\n}\nbody {\ndisplay: block;\nmargin: 0;\npadding: 0;\n}\n",
+    );
+    if any_panels {
+        // Panel View: the tap boxes sit over the page, the magnification
+        // targets stay hidden until the firmware shows one.
+        css.push_str("#PV {\nposition: absolute;\nwidth: 100%;\nheight: 100%;\ntop: 0;\nleft: 0;\n}\n.PV-P {\nposition: absolute;\nwidth: 100%;\nheight: 100%;\ntop: 0;\nleft: 0;\ndisplay: none;\n}\n");
+    }
     fs::write(temp_dir.join("comic.css"), css.as_bytes())?;
 
     // Handle external cover image if provided
@@ -2918,14 +2925,14 @@ fn build_comic_opf_v2(
 
     // Writing mode meta for RTL
     let writing_mode_meta = if rtl {
-        "    <meta name=\"writing-mode\" content=\"horizontal-rl\"/>\n"
+        "    <meta name=\"primary-writing-mode\" content=\"horizontal-rl\"/>\n"
     } else {
         ""
     };
 
     // Panel View metadata
     let panel_view_meta = if panel_view {
-        "    <meta name=\"book-type\" content=\"comic\"/>\n    <meta name=\"region-mag\" content=\"true\"/>\n"
+        "    <meta name=\"book-type\" content=\"comic\"/>\n    <meta name=\"RegionMagnification\" content=\"true\"/>\n"
     } else {
         ""
     };
@@ -2974,6 +2981,65 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Largest magnification a panel gets. Past this the page JPEG, which is
+/// at most the device resolution, is only being blurred.
+const PANEL_VIEW_MAX_SCALE: f64 = 2.5;
+
+/// Build the Kindle Panel View markup for one page: Amazon's Region
+/// Magnification, which is the only tap-to-zoom the firmware knows.
+///
+/// Each panel becomes a `position:absolute` box over the page holding an
+/// `<a class="app-amzn-magnify">` whose JSON names a target container and
+/// the panel's place in the reading order. Each target is a hidden
+/// `.PV-P` div that shows the page image scaled so the panel fills the
+/// viewport, offset so the panel sits centered. This is the shape KCC
+/// writes and kindlegen passes through; kindlegen sets `region-mag` to
+/// false for a page that has no such anchor, and the device then falls
+/// back to its own Virtual Panels, so any other markup is inert.
+///
+/// `pretty` adds newlines between elements; the parity shape is one line.
+fn panel_view_markup(
+    page_index: usize,
+    img_width: u32,
+    img_height: u32,
+    rects: &[PanelRect],
+    pretty: bool,
+) -> String {
+    let nl = if pretty { "\n" } else { "" };
+    let vw = img_width as f64;
+    let vh = img_height as f64;
+    let mut boxes = String::new();
+    let mut targets = String::new();
+    for (i, rect) in rects.iter().enumerate() {
+        let ordinal = i + 1;
+        boxes.push_str(&format!(
+            r#"<div id="PV-{ordinal}" style="position:absolute;left:{x:.1}%;top:{y:.1}%;width:{w:.1}%;height:{h:.1}%;"><a style="display:inline-block;width:100%;height:100%;" class="app-amzn-magnify" data-app-amzn-magnify='{{"targetId":"PV-{ordinal}-P", "ordinal":{ordinal}}}'></a></div>{nl}"#,
+            x = rect.x,
+            y = rect.y,
+            w = rect.w,
+            h = rect.h,
+        ));
+
+        // Panel box in page pixels.
+        let px = rect.x / 100.0 * vw;
+        let py = rect.y / 100.0 * vh;
+        let pw = (rect.w / 100.0 * vw).max(1.0);
+        let ph = (rect.h / 100.0 * vh).max(1.0);
+        // Scale so the panel fills the viewport, never shrinking the page.
+        let scale = (vw / pw).min(vh / ph).clamp(1.0, PANEL_VIEW_MAX_SCALE);
+        let sw = (vw * scale).round() as u32;
+        let sh = (vh * scale).round() as u32;
+        // Offset so the scaled panel sits centered in the viewport.
+        let left = ((vw - pw * scale) / 2.0 - px * scale).round() as i64;
+        let top = ((vh - ph * scale) / 2.0 - py * scale).round() as i64;
+        targets.push_str(&format!(
+            r#"<div class="PV-P" id="PV-{ordinal}-P" style="background-color:#000000;"><img style="position:absolute;left:{left}px;top:{top}px;" src="images/page_{index:04}.jpg" width="{sw}" height="{sh}"/></div>{nl}"#,
+            index = page_index,
+        ));
+    }
+    format!(r#"<div id="PV">{nl}{boxes}</div>{nl}{targets}"#)
+}
+
 /// Build an XHTML page for a single comic page, with optional Panel View markup.
 ///
 /// Two shapes:
@@ -2999,19 +3065,7 @@ fn build_page_xhtml(
     if kindlegen_parity {
         let panel_divs = match panels {
             Some(rects) if !rects.is_empty() => {
-                let mut divs = String::new();
-                divs.push_str(r#"<div id="panels" style="position:absolute;top:0;left:0;width:100%;height:100%">"#);
-                for rect in rects {
-                    divs.push_str(&format!(
-                        r#"<div class="panel" style="position:absolute;left:{x:.1}%;top:{y:.1}%;width:{w:.1}%;height:{h:.1}%"></div>"#,
-                        x = rect.x,
-                        y = rect.y,
-                        w = rect.w,
-                        h = rect.h,
-                    ));
-                }
-                divs.push_str("</div>");
-                divs
+                panel_view_markup(page_index, img_width, img_height, rects, false)
             }
             _ => String::new(),
         };
@@ -3028,19 +3082,7 @@ fn build_page_xhtml(
     // Default ("better than kindlegen") template.
     let panel_divs = match panels {
         Some(rects) if !rects.is_empty() => {
-            let mut divs = String::new();
-            divs.push_str("  <div id=\"panels\" style=\"position:absolute;top:0;left:0;width:100%;height:100%\">\n");
-            for rect in rects {
-                divs.push_str(&format!(
-                    "    <div class=\"panel\" style=\"position:absolute;left:{x:.1}%;top:{y:.1}%;width:{w:.1}%;height:{h:.1}%\"></div>\n",
-                    x = rect.x,
-                    y = rect.y,
-                    w = rect.w,
-                    h = rect.h,
-                ));
-            }
-            divs.push_str("  </div>\n");
-            divs
+            panel_view_markup(page_index, img_width, img_height, rects, true)
         }
         _ => String::new(),
     };
@@ -3528,5 +3570,62 @@ mod profile_tests {
             let p = get_profile(name).unwrap_or_else(|| panic!("{name} missing"));
             assert_eq!((p.width, p.height, p.grayscale), (w, h, gray), "{name}");
         }
+    }
+
+    #[test]
+    fn panel_view_markup_is_region_magnification() {
+        let rects = [
+            PanelRect {
+                x: 50.0,
+                y: 0.0,
+                w: 50.0,
+                h: 50.0,
+            },
+            PanelRect {
+                x: 0.0,
+                y: 0.0,
+                w: 50.0,
+                h: 50.0,
+            },
+        ];
+        let out = panel_view_markup(3, 1000, 1500, &rects, true);
+
+        // One tap box per panel, numbered in the order given, each naming
+        // its own target.
+        assert_eq!(out.matches(r#"class="app-amzn-magnify""#).count(), 2);
+        assert!(out.contains(r#"data-app-amzn-magnify='{"targetId":"PV-1-P", "ordinal":1}'"#));
+        assert!(out.contains(r#"data-app-amzn-magnify='{"targetId":"PV-2-P", "ordinal":2}'"#));
+        assert!(out.contains(r#"<div id="PV-1" style="position:absolute;left:50.0%;top:0.0%;width:50.0%;height:50.0%;">"#));
+
+        // One hidden target per panel, showing the page scaled so the panel
+        // fills the viewport (here 2x), offset so the panel sits at the
+        // origin: the right half of the page starts 1000px to the left.
+        assert_eq!(out.matches(r#"class="PV-P""#).count(), 2);
+        assert!(out.contains(
+            r#"<div class="PV-P" id="PV-1-P" style="background-color:#000000;"><img style="position:absolute;left:-1000px;top:0px;" src="images/page_0003.jpg" width="2000" height="3000"/></div>"#
+        ));
+        assert!(out.contains(r#"id="PV-2-P" style="background-color:#000000;"><img style="position:absolute;left:0px;top:0px;""#));
+    }
+
+    #[test]
+    fn panel_view_scale_is_capped() {
+        // A tiny panel is not blown up past the cap.
+        let rects = [PanelRect {
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        }];
+        let out = panel_view_markup(0, 1000, 1500, &rects, false);
+        assert!(out.contains(r#"width="2500" height="3750""#), "{out}");
+        // Nothing is ever shrunk: a panel that already fills the page stays 1x.
+        let rects = [PanelRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        }];
+        let out = panel_view_markup(0, 1000, 1500, &rects, false);
+        assert!(out.contains(r#"width="1000" height="1500""#), "{out}");
     }
 }
