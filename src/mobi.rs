@@ -3301,10 +3301,11 @@ fn trim_leading_separators(text: &str) -> String {
 ///   attribute, which those readers do honor. This is what kindlegen writes
 ///   for the same intent. Every `--legacy-mobi` comic page is wrapped in one
 ///   of these, so without it no page is centered on the old hardware.
+/// * The Panel View block is dropped. Region Magnification is KF8 markup a
+///   MOBI6 reader cannot act on, and its hidden targets each hold a copy of
+///   the page image, which would render as extra pages there.
 /// * `position:absolute` is dropped. It is KF8 markup with nothing to
-///   position against here; the comic builder's Panel View block is a
-///   `position:absolute` div per panel, and kindlegen reduces the same block
-///   to bare `<div></div>` children.
+///   position against here.
 ///
 /// Every other `style` attribute is left alone. A KF7 reader ignores them, so
 /// removing them would only churn bytes, and a blanket strip is the kind of
@@ -3328,6 +3329,9 @@ fn translate_css_for_legacy_readers(html: &str) -> String {
         .get_or_init(|| Regex::new(r#"(?is)<meta\b[^>]*name\s*=\s*"viewport"[^>]*>\s*"#).unwrap());
 
     let mut out = std::borrow::Cow::Borrowed(html);
+    if out.contains(r#"<div id="PV">"#) {
+        out = std::borrow::Cow::Owned(strip_panel_view_block(&out));
+    }
     if out.contains("text-align") {
         out = std::borrow::Cow::Owned(center.replace_all(&out, " align=\"center\"").to_string());
     }
@@ -3338,6 +3342,28 @@ fn translate_css_for_legacy_readers(html: &str) -> String {
         out = std::borrow::Cow::Owned(viewport.replace_all(&out, "").to_string());
     }
     out.into_owned()
+}
+
+/// Remove the comic builder's Panel View block from a page: the `<div
+/// id="PV">` box container and every `.PV-P` target after it, up to the
+/// closing `</body>`. The block is the last thing in the body, so the cut
+/// runs from the container's start to the final `</div>` before `</body>`.
+fn strip_panel_view_block(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find(r#"<div id="PV">"#) {
+        let Some(body_end) = rest[start..].find("</body>") else {
+            break;
+        };
+        let block = &rest[start..start + body_end];
+        let Some(last_div) = block.rfind("</div>") else {
+            break;
+        };
+        out.push_str(rest[..start].trim_end());
+        rest = &rest[start + last_div + "</div>".len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Remove `<link ... href="kindle:flow:...">` elements from KF7 text.
@@ -4551,9 +4577,14 @@ mod record_split_tests {
             "</head><body style=\"background-color:#000000;\">\n",
             "<div style=\"text-align:center;\">\n",
             "<img width=\"1072\" height=\"1448\" src=\"images/page_0000.jpg\"/>\n</div>\n",
-            "  <div id=\"panels\" style=\"position:absolute;top:0;left:0;width:100%;height:100%\">\n",
-            "    <div class=\"panel\" style=\"position:absolute;left:5.5%;top:3.7%;width:89.1%;height:43.9%\"></div>\n",
-            "  </div></body></html>"
+            "<div id=\"PV\">\n",
+            "<div id=\"PV-1\" style=\"position:absolute;left:5.5%;top:3.7%;width:89.1%;height:43.9%;\">",
+            "<a style=\"display:inline-block;width:100%;height:100%;\" class=\"app-amzn-magnify\" ",
+            "data-app-amzn-magnify='{\"targetId\":\"PV-1-P\", \"ordinal\":1}'></a></div>\n",
+            "</div>\n",
+            "<div class=\"PV-P\" id=\"PV-1-P\" style=\"background-color:#000000;\">",
+            "<img style=\"position:absolute;left:-63px;top:-54px;\" src=\"images/page_0000.jpg\" width=\"1203\" height=\"1625\"/></div>\n",
+            "</body></html>"
         );
         let out = translate_css_for_legacy_readers(page);
 
@@ -4567,15 +4598,20 @@ mod record_split_tests {
             !out.contains("text-align"),
             "the inert style should be gone:\n{out}"
         );
-        // Panel View is KF8 markup; the block survives with its positioning
-        // dropped, the way kindlegen reduces it.
+        // Panel View is KF8 markup a MOBI6 reader cannot act on, and its
+        // targets carry a second copy of the page image, so the block goes.
         assert!(
-            !out.contains("position:absolute"),
-            "position:absolute has nothing to position against here:\n{out}"
+            !out.contains("PV") && !out.contains("app-amzn-magnify"),
+            "the Panel View block should be gone:\n{out}"
+        );
+        assert_eq!(
+            out.matches("<img").count(),
+            1,
+            "only the page image itself should remain:\n{out}"
         );
         assert!(
-            out.contains(r#"<div class="panel"></div>"#),
-            "the panel elements themselves should survive:\n{out}"
+            out.contains("</div>\n</body></html>"),
+            "the body should close right after the page wrapper:\n{out}"
         );
         // A viewport is a fixed-layout instruction and KF7 has no fixed layout.
         assert!(
